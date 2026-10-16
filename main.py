@@ -822,7 +822,7 @@ async def deliver_backup_link(bot, user_id):
                 chat_id=user_id,
                 text=(
                     "✅ Keanggotaan seluruh 11 grup VIP telah diverifikasi.\n\n"
-                    "🛟 LINK GRUP BACKUP:\n"
+                    "🔗 LINK GRUP BACKUP:\n"
                     f"{link}\n\n"
                     "Tautan hanya dapat digunakan sekali dan berlaku "
                     f"{INVITE_MINUTES} menit. Jangan bagikan tautan ini."
@@ -1711,7 +1711,7 @@ async def backup_command(update, context):
         return
 
     await update.effective_message.reply_text(
-        "🛟 Sedang memeriksa syarat grup backup..."
+        "🔗 Sedang memeriksa syarat grup backup..."
     )
 
     success, message = await deliver_backup_link(
