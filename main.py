@@ -76,10 +76,6 @@ PRICE_PER_GROUP = max(
     1, int(os.getenv("PRICE_PER_GROUP", "10000"))
 )
 
-INVITE_MINUTES = max(
-    1, int(os.getenv("INVITE_MINUTES", "60"))
-)
-
 PAYMENT_CHECK_INTERVAL = max(
     5, int(os.getenv("PAYMENT_CHECK_INTERVAL", "5"))
 )
@@ -699,16 +695,14 @@ async def require_vip_access(update, context):
 # 4. LINK UNDANGAN GRUP
 # =========================================================
 
-async def create_single_use_invite(bot, group_id, expire_minutes):
+async def create_single_use_invite(bot, group_id):
     """
-    Tautan hanya dapat digunakan sekali dan memiliki batas waktu.
+    Tautan tanpa batas waktu, tetapi hanya dapat dipakai 1 orang
+    (member_limit=1). Setelah dipakai sekali, tautan otomatis hangus.
     Bot harus mempunyai izin membuat tautan undangan.
     """
-    expires = now_utc() + timedelta(minutes=expire_minutes)
-
     invite = await bot.create_chat_invite_link(
         chat_id=int(group_id),
-        expire_date=expires,
         member_limit=1,
         creates_join_request=False,
     )
@@ -729,7 +723,6 @@ async def send_paid_group_invites(bot, user_id, group_ids):
             link = await create_single_use_invite(
                 bot,
                 group_id,
-                INVITE_MINUTES,
             )
 
             await bot.send_message(
@@ -737,9 +730,9 @@ async def send_paid_group_invites(bot, user_id, group_ids):
                 text=(
                     f"🔐 {get_group_name(group_id)}\n\n"
                     f"{link}\n\n"
-                    "Tautan hanya dapat digunakan sekali dan berlaku "
-                    f"{INVITE_MINUTES} menit. Jika Anda keluar dari grup, "
-                    "Anda perlu membayar lagi."
+                    "Tautan tidak memiliki batas waktu, tetapi hanya dapat "
+                    "diklik 1 kali. Setelah dipakai, tautan langsung hangus. "
+                    "Jika Anda keluar dari grup, Anda perlu membayar lagi."
                 ),
                 disable_web_page_preview=True,
             )
@@ -807,7 +800,7 @@ async def deliver_backup_link(bot, user_id):
                 return (
                     False,
                     "Link backup sudah pernah dikirim oleh bot. "
-                    "Jika tautan kedaluwarsa atau Anda kehilangan akses, "
+                    "Jika Anda kehilangan akses, "
                     "silakan hubungi admin.",
                 )
 
@@ -815,7 +808,6 @@ async def deliver_backup_link(bot, user_id):
             link = await create_single_use_invite(
                 bot,
                 BACKUP_GROUP_ID,
-                INVITE_MINUTES,
             )
 
             await bot.send_message(
@@ -824,8 +816,9 @@ async def deliver_backup_link(bot, user_id):
                     "✅ Keanggotaan seluruh 11 grup VIP telah diverifikasi.\n\n"
                     "🔗 LINK GRUP BACKUP:\n"
                     f"{link}\n\n"
-                    "Tautan hanya dapat digunakan sekali dan berlaku "
-                    f"{INVITE_MINUTES} menit. Jangan bagikan tautan ini."
+                    "Tautan tidak memiliki batas waktu, tetapi hanya dapat "
+                    "diklik 1 kali. Setelah dipakai, tautan langsung hangus. "
+                    "Jangan bagikan tautan ini."
                 ),
                 disable_web_page_preview=True,
             )
