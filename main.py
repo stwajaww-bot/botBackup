@@ -814,7 +814,7 @@ async def deliver_backup_link(bot, user_id):
                 chat_id=user_id,
                 text=(
                     "✅ Keanggotaan seluruh 11 grup VIP telah diverifikasi.\n\n"
-                    "🔗 LINK GRUP BACKUP:\n"
+                    "🛟 LINK GRUP BACKUP:\n"
                     f"{link}\n\n"
                     "Tautan tidak memiliki batas waktu, tetapi hanya dapat "
                     "diklik 1 kali. Setelah dipakai, tautan langsung hangus. "
@@ -1515,7 +1515,7 @@ async def create_invoice_callback(update, context):
         save_json(TRANSACTIONS_FILE, transactions)
 
     order_id = (
-        f"{ORDER_ID_PREFIX}{user.id}{int(now_utc().timestamp())}"
+        f"{ORDER_ID_PREFIX}-{user.id}-{int(now_utc().timestamp())}-"
         f"{secrets.token_hex(3).upper()}"
     )
 
@@ -1586,7 +1586,7 @@ def main_keyboard():
         [
             [KeyboardButton("🔎 Cek Keanggotaan VIP")],
             [KeyboardButton("🛒 Beli/Akses Grup VIP")],
-            [KeyboardButton("🔗 Link Backup")],
+            [KeyboardButton("🛟 Link Backup")],
             [KeyboardButton("💬 Hubungi Admin")],
         ],
         resize_keyboard=True,
@@ -1704,7 +1704,7 @@ async def backup_command(update, context):
         return
 
     await update.effective_message.reply_text(
-        "🔗 Sedang memeriksa syarat grup backup..."
+        "🛟 Sedang memeriksa syarat grup backup..."
     )
 
     success, message = await deliver_backup_link(
@@ -1929,7 +1929,7 @@ async def text_router(update, context):
     elif text == "🔎 Cek Keanggotaan VIP":
         await check_vip_command(update, context)
 
-    elif text == "🔗 Link Backup":
+    elif text == "🛟 Link Backup":
         await backup_command(update, context)
 
     elif text == "💬 Hubungi Admin":
