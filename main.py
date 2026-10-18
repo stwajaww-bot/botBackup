@@ -23,12 +23,15 @@ from telegram import (
     KeyboardButton,
 )
 from telegram.constants import ParseMode, ChatAction
-from telegram.error import TelegramError
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
+    ChatMemberHandler,
+    TypeHandler,
+    ApplicationHandlerStop,
     ContextTypes,
     filters,
 )
@@ -114,6 +117,9 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 TRANSACTIONS_FILE = DATA_DIR / "transactions.json"
 PAID_GROUPS_FILE = DATA_DIR / "paid_groups.json"
 BACKUP_USERS_FILE = DATA_DIR / "backup_users.json"
+USERS_FILE = DATA_DIR / "users.json"
+BLOCKED_FILE = DATA_DIR / "blocked_users.json"
+INVITE_LINKS_FILE = DATA_DIR / "invite_links.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -695,7 +701,7 @@ async def require_vip_access(update, context):
 # 4. LINK UNDANGAN GRUP
 # =========================================================
 
-async def create_single_use_invite(bot, group_id):
+async def create_single_use_invite(bot, group_id, user_id=None, kind="vip"):
     """
     Tautan tanpa batas waktu, tetapi hanya dapat dipakai 1 orang
     (member_limit=1). Setelah dipakai sekali, tautan otomatis hangus.
@@ -706,6 +712,9 @@ async def create_single_use_invite(bot, group_id):
         member_limit=1,
         creates_join_request=False,
     )
+
+    if user_id is not None:
+        await record_invite(user_id, group_id, invite.invite_link, kind)
 
     return invite.invite_link
 
@@ -723,6 +732,8 @@ async def send_paid_group_invites(bot, user_id, group_ids):
             link = await create_single_use_invite(
                 bot,
                 group_id,
+                user_id,
+                "vip",
             )
 
             await bot.send_message(
@@ -808,6 +819,8 @@ async def deliver_backup_link(bot, user_id):
             link = await create_single_use_invite(
                 bot,
                 BACKUP_GROUP_ID,
+                user_id,
+                "backup",
             )
 
             await bot.send_message(
@@ -2019,6 +2032,7 @@ async def backup_monitor(context):
     async with DATA_LOCK:
         transactions = load_json(TRANSACTIONS_FILE, {})
         backup_data = load_json(BACKUP_USERS_FILE, {})
+        blocked = load_json(BLOCKED_FILE, {})
 
         paid_users = {
             str(tx.get("user_id"))
@@ -2029,7 +2043,8 @@ async def backup_monitor(context):
         pending_users = [
             user_id
             for user_id in paid_users
-            if not (
+            if user_id not in blocked
+            and not (
                 isinstance(backup_data.get(user_id), dict)
                 and backup_data[user_id].get("sent")
             )
@@ -2050,7 +2065,644 @@ async def backup_monitor(context):
 
 
 # =========================================================
-# 15. ERROR HANDLER
+# 15. FITUR ADMIN
+# =========================================================
+
+def fmt_wib(value):
+    moment = parse_datetime(value)
+
+    if not moment:
+        return "-"
+
+    return moment.astimezone(WIB).strftime("%Y-%m-%d %H:%M:%S WIB")
+
+
+def is_admin_user(user):
+    return bool(user) and str(user.id) in ADMIN_IDS
+
+
+def admin_only(func):
+    """Perintah diabaikan diam-diam jika pengirim bukan admin."""
+
+    @functools.wraps(func)
+    async def wrapper(update, context, *args, **kwargs):
+        if not is_admin_user(update.effective_user):
+            return
+
+        return await func(update, context, *args, **kwargs)
+
+    return wrapper
+
+
+def parse_target(args, default=None):
+    if args:
+        value = args[0].strip()
+
+        if value.isdigit():
+            return int(value)
+
+        return None
+
+    return default
+
+
+async def register_user(user):
+    """Catat pengguna yang berinteraksi dengan bot (untuk /stats, /broadcast)."""
+    name = " ".join(
+        part for part in [user.first_name, user.last_name] if part
+    )
+    username = user.username or ""
+    now = now_utc()
+    key = str(user.id)
+
+    async with DATA_LOCK:
+        users = load_json(USERS_FILE, {})
+        record = users.get(key)
+
+        if record:
+            last_seen = parse_datetime(record.get("last_seen"))
+
+            fresh = (
+                last_seen is not None
+                and (now - last_seen).total_seconds() < 3600
+                and record.get("name") == name
+                and record.get("username") == username
+                and not record.get("bot_blocked")
+            )
+
+            if fresh:
+                return
+
+            record.update(
+                {
+                    "name": name,
+                    "username": username,
+                    "last_seen": now.isoformat(),
+                    "bot_blocked": False,
+                }
+            )
+
+        else:
+            record = {
+                "first_seen": now.isoformat(),
+                "last_seen": now.isoformat(),
+                "name": name,
+                "username": username,
+                "bot_blocked": False,
+            }
+
+        users[key] = record
+        save_json(USERS_FILE, users)
+
+
+def seed_users_from_history():
+    """
+    Saat bot start: masukkan pengguna lama (dari riwayat transaksi dan
+    backup) ke daftar pengguna agar ikut terhitung di /stats dan /broadcast.
+    """
+    users = load_json(USERS_FILE, {})
+    transactions = load_json(TRANSACTIONS_FILE, {})
+    backup = load_json(BACKUP_USERS_FILE, {})
+
+    changed = False
+
+    for tx in transactions.values():
+        key = str(tx.get("user_id") or "")
+
+        if key and key not in users:
+            users[key] = {
+                "first_seen": tx.get("created_at") or iso_now(),
+                "last_seen": tx.get("created_at") or iso_now(),
+                "name": "",
+                "username": tx.get("username") or "",
+                "bot_blocked": False,
+            }
+            changed = True
+
+    for key, record in backup.items():
+        if key not in users:
+            sent_at = (
+                record.get("sent_at")
+                if isinstance(record, dict)
+                else None
+            )
+            users[key] = {
+                "first_seen": sent_at or iso_now(),
+                "last_seen": sent_at or iso_now(),
+                "name": "",
+                "username": "",
+                "bot_blocked": False,
+            }
+            changed = True
+
+    if changed:
+        save_json(USERS_FILE, users)
+
+
+async def is_blocked(user_id):
+    async with DATA_LOCK:
+        return str(user_id) in load_json(BLOCKED_FILE, {})
+
+
+async def record_invite(user_id, chat_id, link, kind):
+    async with DATA_LOCK:
+        links = load_json(INVITE_LINKS_FILE, {})
+        links[link] = {
+            "user_id": str(user_id),
+            "chat_id": str(chat_id),
+            "kind": kind,
+            "created_at": iso_now(),
+            "revoked": False,
+            "used": False,
+        }
+        save_json(INVITE_LINKS_FILE, links)
+
+
+async def revoke_user_links(bot, user_id):
+    """Cabut semua link milik user yang belum dipakai dan belum dicabut."""
+    async with DATA_LOCK:
+        links = load_json(INVITE_LINKS_FILE, {})
+
+        targets = [
+            (link, record)
+            for link, record in links.items()
+            if record.get("user_id") == str(user_id)
+            and not record.get("revoked")
+            and not record.get("used")
+        ]
+
+    done = []
+    failed = 0
+
+    for link, record in targets:
+        try:
+            await bot.revoke_chat_invite_link(
+                chat_id=int(record["chat_id"]),
+                invite_link=link,
+            )
+            done.append(link)
+
+        except BadRequest:
+            # Link sudah tidak valid di Telegram; anggap sudah tercabut.
+            done.append(link)
+
+        except TelegramError:
+            logger.exception("Gagal mencabut link %s", link)
+            failed += 1
+
+    if done:
+        async with DATA_LOCK:
+            links = load_json(INVITE_LINKS_FILE, {})
+
+            for link in done:
+                if link in links:
+                    links[link]["revoked"] = True
+                    links[link]["revoked_at"] = iso_now()
+
+            save_json(INVITE_LINKS_FILE, links)
+
+    return len(done), failed
+
+
+async def on_chat_member(update, context):
+    """Tandai link sebagai terpakai ketika seseorang bergabung lewat link itu."""
+    change = update.chat_member
+
+    if not change or not change.invite_link:
+        return
+
+    status = getattr(
+        change.new_chat_member.status,
+        "value",
+        change.new_chat_member.status,
+    )
+
+    if str(status) not in {"member", "restricted", "administrator"}:
+        return
+
+    async with DATA_LOCK:
+        links = load_json(INVITE_LINKS_FILE, {})
+        record = links.get(change.invite_link.invite_link)
+
+        if record and not record.get("used"):
+            record["used"] = True
+            record["used_at"] = iso_now()
+            record["used_by"] = str(change.new_chat_member.user.id)
+            save_json(INVITE_LINKS_FILE, links)
+
+
+async def gate_handler(update, context):
+    """
+    Dijalankan sebelum handler lain:
+    - mencatat pengguna chat pribadi;
+    - menolak pengguna yang diblokir admin.
+    """
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if not user or user.is_bot or not chat or chat.type != "private":
+        return
+
+    await register_user(user)
+
+    if is_admin_user(user):
+        return
+
+    if await is_blocked(user.id):
+        if update.callback_query:
+            await update.callback_query.answer(
+                "Akun Anda diblokir dari bot ini.",
+                show_alert=True,
+            )
+
+        elif update.effective_message:
+            await update.effective_message.reply_text(
+                "⛔ Akun Anda diblokir dari bot ini. "
+                "Hubungi admin jika ini sebuah kesalahan."
+            )
+
+        raise ApplicationHandlerStop
+
+
+@admin_only
+@with_action(ChatAction.TYPING)
+async def stats_command(update, context):
+    async with DATA_LOCK:
+        users = load_json(USERS_FILE, {})
+        blocked = load_json(BLOCKED_FILE, {})
+        backup = load_json(BACKUP_USERS_FILE, {})
+        links = load_json(INVITE_LINKS_FILE, {})
+        transactions = load_json(TRANSACTIONS_FILE, {})
+
+    took_backup = sum(
+        1
+        for record in backup.values()
+        if isinstance(record, dict) and record.get("sent")
+    )
+
+    active_links = sum(
+        1
+        for record in links.values()
+        if not record.get("revoked") and not record.get("used")
+    )
+
+    paid = [
+        tx for tx in transactions.values() if tx.get("status") == "PAID"
+    ]
+    pending = sum(
+        1 for tx in transactions.values() if tx.get("status") == "PENDING"
+    )
+    revenue = sum(int(tx.get("amount", 0) or 0) for tx in paid)
+
+    await update.effective_message.reply_text(
+        "📊 STATISTIK BOT\n\n"
+        f"👥 Total pengguna: {len(users)}\n"
+        f"🛟 Sudah ambil link backup: {took_backup}\n"
+        f"⛔ Diblokir: {len(blocked)}\n"
+        f"🔗 Link belum dipakai & belum dicabut: {active_links}\n\n"
+        f"💳 Pembelian sukses: {len(paid)}\n"
+        f"⏳ Menunggu pembayaran: {pending}\n"
+        f"💰 Total diterima: {format_rupiah_spaced(revenue)}"
+    )
+
+
+def membership_text(status):
+    return {
+        "member": "Ya",
+        "not_member": "Tidak",
+    }.get(status, "Tidak dapat diverifikasi")
+
+
+@admin_only
+@with_action(ChatAction.TYPING)
+async def cek_command(update, context):
+    message = update.effective_message
+    target = parse_target(context.args)
+
+    if target is None:
+        await message.reply_text("Gunakan: /cek <id telegram>")
+        return
+
+    async with DATA_LOCK:
+        users = load_json(USERS_FILE, {})
+        blocked = load_json(BLOCKED_FILE, {})
+        backup = load_json(BACKUP_USERS_FILE, {})
+        links = load_json(INVITE_LINKS_FILE, {})
+        transactions = load_json(TRANSACTIONS_FILE, {})
+
+    key = str(target)
+    user = users.get(key)
+
+    backup_record = backup.get(key)
+    took_backup = (
+        isinstance(backup_record, dict) and backup_record.get("sent")
+    )
+
+    in_backup = await check_group_membership(
+        context.bot, target, BACKUP_GROUP_ID
+    )
+    vip = await check_all_vip_membership(context.bot, target)
+
+    joined = sum(1 for item in vip.values() if item["status"] == "member")
+    unknown = sum(1 for item in vip.values() if item["status"] == "unknown")
+
+    orders = [
+        tx
+        for tx in transactions.values()
+        if str(tx.get("user_id")) == key
+    ]
+    paid_orders = [tx for tx in orders if tx.get("status") == "PAID"]
+    last_order = max(orders, key=lambda tx: tx.get("created_at", ""), default=None)
+
+    rights = await get_paid_groups(target)
+
+    active_links = sum(
+        1
+        for record in links.values()
+        if record.get("user_id") == key
+        and not record.get("revoked")
+        and not record.get("used")
+    )
+
+    if user:
+        name = user.get("name") or "-"
+        username = f"@{user['username']}" if user.get("username") else "-"
+        first_seen = fmt_wib(user.get("first_seen"))
+        last_seen = fmt_wib(user.get("last_seen"))
+    else:
+        name = username = "-"
+        first_seen = last_seen = "belum pernah terlihat oleh bot"
+
+    lines = [
+        f"🔎 DATA MEMBER {target}",
+        "",
+        f"Nama: {name}",
+        f"Username: {username}",
+        f"Pertama terlihat: {first_seen}",
+        f"Terakhir aktif: {last_seen}",
+        "",
+        f"Di grup backup: {membership_text(in_backup)}",
+        "Sudah ambil link backup: "
+        + (
+            f"Ya ({fmt_wib(backup_record.get('sent_at'))})"
+            if took_backup
+            else "Belum"
+        ),
+        f"Grup VIP diikuti: {joined}/{len(VIP11_GROUP_IDS)}"
+        + (f" ({unknown} tidak dapat diverifikasi)" if unknown else ""),
+        "",
+        f"Pembelian sukses: {len(paid_orders)}",
+        "Order terakhir: "
+        + (
+            f"{last_order['order_id']} — {last_order.get('status')}"
+            if last_order
+            else "-"
+        ),
+        f"Hak grup belum terkirim: {len(rights)}",
+        f"Link aktif (belum dipakai/dicabut): {active_links}",
+        "",
+        "Status blokir: " + ("⛔ DIBLOKIR" if key in blocked else "Tidak diblokir"),
+    ]
+
+    await message.reply_text("\n".join(lines))
+
+
+@admin_only
+@with_action(ChatAction.TYPING)
+async def reset_command(update, context):
+    message = update.effective_message
+    target = parse_target(context.args, default=update.effective_user.id)
+
+    if target is None:
+        await message.reply_text("Gunakan: /reset [id telegram]")
+        return
+
+    revoked, failed = await revoke_user_links(context.bot, target)
+
+    async with DATA_LOCK:
+        backup = load_json(BACKUP_USERS_FILE, {})
+        had_backup = str(target) in backup
+
+        if had_backup:
+            backup.pop(str(target), None)
+            save_json(BACKUP_USERS_FILE, backup)
+
+    await message.reply_text(
+        f"♻️ RESET {target}\n\n"
+        f"Link dicabut: {revoked}"
+        + (f" (gagal: {failed})" if failed else "")
+        + "\nStatus link backup: "
+        + ("direset, member dapat meminta lagi." if had_backup else "memang belum pernah dikirim.")
+    )
+
+
+@admin_only
+@with_action(ChatAction.TYPING)
+async def blokir_command(update, context):
+    message = update.effective_message
+    target = parse_target(context.args)
+
+    if target is None:
+        await message.reply_text("Gunakan: /blokir <id telegram>")
+        return
+
+    if str(target) in ADMIN_IDS:
+        await message.reply_text("Admin tidak dapat diblokir.")
+        return
+
+    async with DATA_LOCK:
+        blocked = load_json(BLOCKED_FILE, {})
+        blocked[str(target)] = {
+            "blocked_at": iso_now(),
+            "by": str(update.effective_user.id),
+        }
+        save_json(BLOCKED_FILE, blocked)
+
+    revoked, failed = await revoke_user_links(context.bot, target)
+
+    await message.reply_text(
+        f"⛔ {target} diblokir.\n"
+        f"Link yang dicabut: {revoked}"
+        + (f" (gagal: {failed})" if failed else "")
+    )
+
+
+@admin_only
+@with_action(ChatAction.TYPING)
+async def unblokir_command(update, context):
+    message = update.effective_message
+    target = parse_target(context.args)
+
+    if target is None:
+        await message.reply_text("Gunakan: /unblokir <id telegram>")
+        return
+
+    async with DATA_LOCK:
+        blocked = load_json(BLOCKED_FILE, {})
+        existed = blocked.pop(str(target), None) is not None
+
+        if existed:
+            save_json(BLOCKED_FILE, blocked)
+
+    await message.reply_text(
+        f"✅ {target} dibuka blokirnya."
+        if existed
+        else f"{target} memang tidak sedang diblokir."
+    )
+
+
+async def broadcast_recipients():
+    async with DATA_LOCK:
+        users = load_json(USERS_FILE, {})
+        blocked = load_json(BLOCKED_FILE, {})
+
+    return [
+        key
+        for key, record in users.items()
+        if key not in blocked and not record.get("bot_blocked")
+    ]
+
+
+@admin_only
+async def broadcast_command(update, context):
+    message = update.effective_message
+    parts = (message.text or "").split(None, 1)
+
+    if len(parts) < 2 or not parts[1].strip():
+        await message.reply_text("Gunakan: /broadcast <pesan>")
+        return
+
+    text = parts[1].strip()
+
+    if len(text) > 4000:
+        await message.reply_text("Pesan terlalu panjang (maksimal 4000 karakter).")
+        return
+
+    recipients = await broadcast_recipients()
+
+    context.bot_data.setdefault("pending_broadcast", {})[
+        update.effective_user.id
+    ] = text
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Kirim", callback_data="bc_yes"),
+                InlineKeyboardButton("❌ Batal", callback_data="bc_no"),
+            ]
+        ]
+    )
+
+    await message.reply_text(
+        "📣 PRATINJAU BROADCAST\n\n"
+        f"{text}\n\n"
+        f"Akan dikirim ke {len(recipients)} pengguna.",
+        reply_markup=keyboard,
+    )
+
+
+async def run_broadcast(bot, admin_id, text, recipients):
+    sent = 0
+    failed = 0
+    unreachable = []
+
+    for key in recipients:
+        try:
+            try:
+                await bot.send_message(
+                    chat_id=int(key),
+                    text=text,
+                    disable_web_page_preview=True,
+                )
+
+            except RetryAfter as exc:
+                delay = exc.retry_after
+                delay = (
+                    delay.total_seconds()
+                    if hasattr(delay, "total_seconds")
+                    else float(delay)
+                )
+                await asyncio.sleep(delay + 1)
+                await bot.send_message(
+                    chat_id=int(key),
+                    text=text,
+                    disable_web_page_preview=True,
+                )
+
+            sent += 1
+
+        except Forbidden:
+            unreachable.append(key)
+
+        except TelegramError:
+            failed += 1
+
+        await asyncio.sleep(0.05)
+
+    if unreachable:
+        async with DATA_LOCK:
+            users = load_json(USERS_FILE, {})
+
+            for key in unreachable:
+                if key in users:
+                    users[key]["bot_blocked"] = True
+
+            save_json(USERS_FILE, users)
+
+    try:
+        await bot.send_message(
+            chat_id=admin_id,
+            text=(
+                "📣 BROADCAST SELESAI\n\n"
+                f"Terkirim: {sent}\n"
+                f"Gagal: {failed}\n"
+                f"Tidak dapat dihubungi (memblokir bot): {len(unreachable)}"
+            ),
+        )
+
+    except TelegramError:
+        logger.exception("Gagal mengirim laporan broadcast")
+
+
+@admin_only
+async def broadcast_callback(update, context):
+    query = update.callback_query
+    pending = context.bot_data.get("pending_broadcast", {})
+    text = pending.pop(query.from_user.id, None)
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+
+    except TelegramError:
+        pass
+
+    if query.data == "bc_no":
+        await query.answer("Broadcast dibatalkan.")
+        return
+
+    if text is None:
+        await query.answer(
+            "Pratinjau sudah kedaluwarsa. Jalankan /broadcast lagi.",
+            show_alert=True,
+        )
+        return
+
+    await query.answer("Broadcast dimulai.")
+
+    recipients = await broadcast_recipients()
+
+    context.application.create_task(
+        run_broadcast(context.bot, query.from_user.id, text, recipients)
+    )
+
+    await query.message.reply_text(
+        f"⏳ Broadcast dimulai ke {len(recipients)} pengguna. "
+        "Laporan akan dikirim setelah selesai."
+    )
+
+
+# =========================================================
+# 16. ERROR HANDLER
 # =========================================================
 
 async def error_handler(update, context):
@@ -2061,7 +2713,7 @@ async def error_handler(update, context):
 
 
 # =========================================================
-# 16. MENJALANKAN BOT
+# 17. MENJALANKAN BOT
 # =========================================================
 
 _INSTANCE_LOCK = None
@@ -2105,6 +2757,7 @@ def main():
     validate_config()
     acquire_single_instance_lock()
     consume_fulfilled_entitlements()
+    seed_users_from_history()
 
     application = (
         Application.builder()
@@ -2132,6 +2785,34 @@ def main():
     )
     application.add_handler(
         CommandHandler("cekbayar", cekbayar_command, filters=PRIVATE_ONLY)
+    )
+
+    # Perintah admin (diabaikan untuk non-admin)
+    for command_name, handler in (
+        ("stats", stats_command),
+        ("cek", cek_command),
+        ("reset", reset_command),
+        ("blokir", blokir_command),
+        ("unblokir", unblokir_command),
+        ("broadcast", broadcast_command),
+    ):
+        application.add_handler(
+            CommandHandler(command_name, handler, filters=PRIVATE_ONLY)
+        )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            broadcast_callback,
+            pattern=r"^bc_(yes|no)$",
+        )
+    )
+
+    # Pencatat pengguna + penolak pengguna yang diblokir (jalan lebih dulu)
+    application.add_handler(TypeHandler(Update, gate_handler), group=-1)
+
+    # Menandai link sebagai terpakai saat seseorang bergabung
+    application.add_handler(
+        ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER)
     )
 
     application.add_handler(
